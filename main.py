@@ -1537,9 +1537,6 @@ def handle_cmd(text, cid):
         tg_send(f"📉 Choppy mode: {state}")
 
     elif cmd == "/wsstatus":
-        connected = "✅ connected" if _alpaca_ws else "❌ not connected"
-        auth_ok   = "✅ authenticated" if _ws_auth_ok else "❌ not authenticated"
-        n_subs    = len(_ws_subscribed)
         with _bar_lock:
             n_cached = len(_bar_cache)
             cache_info = "\n".join(
@@ -1547,14 +1544,11 @@ def handle_cmd(text, cid):
                 for sym, bars in list(_bar_cache.items())[:5]
             ) or "  (none)"
         tg_send(
-            f"📡 *Alpaca WebSocket Status*\n"
-            f"Socket:  {connected}\n"
-            f"Auth:    {auth_ok}\n"
-            f"Feed:    IEX (free real-time)\n"
-            f"Subscribed: {n_subs} symbol(s)\n"
-            f"Bar cache ({n_cached} symbol(s)):\n{cache_info}\n\n"
-            f"ℹ️ Bars pushed in real-time on minute close. "
-            f"REST fallback active if WS disconnects.")
+            f"📡 *Data Feed Status*\n"
+            f"Mode: REST polling (Alpaca IEX → Polygon REST)\n"
+            f"Alpaca WS: disabled (shared API key — reserved for GreenHebi)\n"
+            f"Cycle interval: ~8s\n"
+            f"Bar cache ({n_cached} symbol(s)):\n{cache_info}")
 
     elif cmd == "/help":
         tg_send(
@@ -1997,14 +1991,15 @@ def main():
 
     startup()
 
-    # Alpaca WebSocket for real-time 1-min bar streaming (free on IEX feed)
-    t_ws = threading.Thread(target=start_alpaca_ws, daemon=True)
-    t_ws.start()
+    # Alpaca WS disabled — free tier allows only 1 concurrent WS connection per
+    # API key, and GreenHebi has priority (bull flag breakouts are more time-sensitive).
+    # KoiScale VWAP setups develop over minutes; 8s REST polling is sufficient.
+    log("INFO", "Alpaca WS: disabled (shared API key — WS reserved for GreenHebi)")
 
     # Start trading cycle on its own thread — decoupled from Telegram
     t_cycle = threading.Thread(target=_cycle_loop, daemon=True)
     t_cycle.start()
-    log("INFO", "Main loop active — cycle: 8s thread | Alpaca WS: live bars | Telegram: long-poll 25s")
+    log("INFO", "Main loop active — cycle: 8s thread | REST bars | Telegram: long-poll 25s")
 
     # Main thread: Telegram commands only
     while True:
