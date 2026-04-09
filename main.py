@@ -61,7 +61,7 @@ MAX_SPREAD_PCT = 0.5      # mid/large-caps should have tight spreads
 PRICE_LO         = 10.0       # $10 minimum (liquid names)
 PRICE_HI         = 500.0      # $500 maximum
 MIN_AVG_VOLUME   = 500_000    # need liquidity for 1/3-out exits
-MAX_WATCHLIST    = 20         # top candidates by VWAP proximity
+MAX_WATCHLIST    = 20         # top candidates by bounce-quality score
 
 # ── MA alignment filter (Shannon stage-2) ────────────────────────────────────
 # All four must hold:
@@ -570,9 +570,9 @@ def scan_stage2_universe():
     1. GET Polygon /v2/snapshot for all US equity tickers
     2. Filter: price $10-$500, prevDay volume > 500K, plain alphabetic symbol
     3. Parallel daily bar fetch → compute_mas() → is_stage2() (cached per day)
-    4. For stage-2 survivors: get_1min_bars() → calc_vwap()
-    5. Rank by |price - vwap| / vwap (closest = most actionable)
-    6. Return top MAX_WATCHLIST candidates
+    4. For stage-2 survivors: get_1min_bars() → calc_vwap() → bounce-quality score
+    5. Score by: approach from above, VWAP proximity, support holding, volume decline, momentum
+    6. Rank by bounce quality (highest first), return top MAX_WATCHLIST candidates
 
     MA results are cached in _daily_ma_cache (keyed by symbol, per day) so
     subsequent scan cycles skip the daily bar fetch for already-checked stocks.
@@ -650,8 +650,8 @@ def scan_stage2_universe():
     if not stage2:
         return []
 
-    # ── Step 4: VWAP proximity (parallel) ─────────────────────────────────────
-    def _vwap_proximity(cand):
+    # ── Step 4: VWAP bounce-quality scoring (parallel) ─────────────────────────
+    def _vwap_score(cand):
         sym   = cand["symbol"]
         price = cand["price"]
         bars  = get_1min_bars(sym, limit=420)
@@ -662,42 +662,134 @@ def scan_stage2_universe():
             return None
         dist_pct = (price - vwap) / vwap * 100   # positive = above VWAP
         abs_dist = abs(dist_pct)
-        # Keep stocks within 2× VWAP_PROXIMITY_PCT of VWAP — sort by closest
+        # Gate: must be within actionable range of VWAP
         if abs_dist > VWAP_PROXIMITY_PCT * 2:
             return None
+
+        # ── Bounce-quality score (0–100) ─────────────────────────────────
+        # Shannon wants: stock that was ABOVE VWAP, pulled back TO it,
+        # and is now showing strength.  Flat-at-VWAP-all-day = boring.
+        recent = bars[-min(30, len(bars)):]
+        score  = 0.0
+
+        # 1. APPROACH FROM ABOVE (0–30 pts)
+        #    Was price meaningfully above VWAP earlier in recent bars?
+        #    Bigger intraday range above VWAP = better setup quality.
+        highs_pct = [(float(b["h"]) - vwap) / vwap * 100 for b in recent]
+        max_above = max(highs_pct) if highs_pct else 0
+        if max_above > 0.5:
+            score += min(max_above / 3.0, 1.0) * 30   # caps at 3% above
+
+        # 2. CURRENT PROXIMITY (0–20 pts)
+        #    Slightly above VWAP (bounce underway) > right at VWAP > below
+        if 0.05 <= dist_pct <= 1.0:
+            score += 20     # ideal: just lifted off VWAP
+        elif -0.2 <= dist_pct < 0.05:
+            score += 15     # touching zone
+        elif 1.0 < dist_pct <= 2.0:
+            score += 10     # still approaching from above
+        elif -0.5 <= dist_pct < -0.2:
+            score += 8      # slight undercut (could reclaim)
+        else:
+            score += max(0, 5 - abs_dist)
+
+        # 3. HOLDING SUPPORT (0–20 pts)
+        #    Recent bar lows staying at or above VWAP = buyers defending
+        last_n = recent[-min(10, len(recent)):]
+        bars_holding = sum(1 for b in last_n
+                          if float(b["l"]) >= vwap * 0.998)
+        score += (bars_holding / len(last_n)) * 20
+
+        # 4. VOLUME PATTERN (0–15 pts)
+        #    Declining volume on pullback = healthy (institutions accumulating)
+        if len(recent) >= 10:
+            half = len(recent) // 2
+            v1 = sum(int(b["v"]) for b in recent[:half])
+            v2 = sum(int(b["v"]) for b in recent[half:])
+            if v1 > 0:
+                vr = v2 / v1
+                score += 15 if vr < 0.7 else (10 if vr < 1.0 else 5)
+        else:
+            score += 5
+
+        # 5. DIRECTIONAL MOMENTUM (0–15 pts)
+        #    Last few bars trending up from VWAP area = bounce confirmation
+        if len(recent) >= 5:
+            closes = [float(b["c"]) for b in recent[-5:]]
+            up = sum(1 for i in range(1, len(closes))
+                     if closes[i] > closes[i - 1])
+            if up >= 3 and closes[-1] > vwap:
+                score += 15
+            elif up >= 2 and closes[-1] > vwap:
+                score += 10
+            elif closes[-1] > vwap:
+                score += 5
+
+        # ── Phase label ──────────────────────────────────────────────────
+        if dist_pct < -0.5:
+            phase = "BELOW"
+        elif abs(dist_pct) <= 0.2:
+            # At VWAP — distinguish bounce from flat
+            if len(recent) >= 3:
+                last3 = [float(b["c"]) for b in recent[-3:]]
+                if (all(c > vwap for c in last3[-2:])
+                        and float(recent[-3]["l"]) <= vwap * 1.002):
+                    phase = "BOUNCING"
+                elif max_above < 0.3:
+                    phase = "FLAT"
+                else:
+                    phase = "TOUCHING"
+            else:
+                phase = "TOUCHING"
+        elif dist_pct > 0.2 and max_above > dist_pct + 0.3:
+            phase = "PULLING BACK"
+        elif dist_pct > 0:
+            if len(recent) >= 3:
+                last3 = [float(b["c"]) for b in recent[-3:]]
+                if all(c > vwap for c in last3) and last3[-1] > last3[0]:
+                    phase = "BOUNCING"
+                else:
+                    phase = "ABOVE"
+            else:
+                phase = "ABOVE"
+        else:
+            phase = "UNDERCUT"
+
         return {
             "symbol":           sym,
             "price":            round(price, 2),
             "vwap":             vwap,
             "vwap_distance_pct": round(dist_pct, 2),
-            "_abs_dist":        abs_dist,
+            "bounce_score":     round(score, 1),
+            "phase":            phase,
+            "_score":           score,
             "mas":              cand["mas"],
             "volume":           cand["volume"],
         }
 
     proximity = []
     with ThreadPoolExecutor(max_workers=5) as pool:
-        futs = {pool.submit(_vwap_proximity, c): c for c in stage2}
+        futs = {pool.submit(_vwap_score, c): c for c in stage2}
         for fut in as_completed(futs):
             try:
                 result = fut.result()
                 if result:
                     proximity.append(result)
             except Exception as e:
-                log("DEBUG", f"vwap proximity error: {e}")
+                log("DEBUG", f"vwap scoring error: {e}")
 
-    # ── Step 5: Rank by VWAP proximity, return top MAX_WATCHLIST ──────────────
-    proximity.sort(key=lambda x: x["_abs_dist"])
+    # ── Step 5: Rank by bounce quality, return top MAX_WATCHLIST ──────────────
+    proximity.sort(key=lambda x: x["_score"], reverse=True)
     top = proximity[:MAX_WATCHLIST]
-    # Remove internal sort key before returning
     for c in top:
-        c.pop("_abs_dist", None)
+        c.pop("_score", None)
 
     log("INFO", f"scan_stage2_universe: returning {len(top)} candidates "
-                f"(of {len(proximity)} with VWAP proximity ≤{VWAP_PROXIMITY_PCT*2:.0f}%)")
+                f"(of {len(proximity)} near VWAP)")
     for c in top[:5]:
         log("DEBUG", f"  {c['symbol']}: ${c['price']:.2f} VWAP ${c['vwap']:.2f} "
-                     f"({c['vwap_distance_pct']:+.1f}%)")
+                     f"({c['vwap_distance_pct']:+.1f}%) "
+                     f"score={c['bounce_score']} phase={c['phase']}")
 
     return top
 
@@ -1485,12 +1577,15 @@ def handle_cmd(text, cid):
         if S.watchlist:
             lines = []
             for w in S.watchlist[:10]:   # cap at 10 for Telegram message length
+                phase = w.get('phase', '?')
+                bs    = w.get('bounce_score', 0)
                 lines.append(
                     f"  *{w.get('symbol','?')}* "
                     f"${w.get('price', 0):.2f} "
                     f"VWAP ${w.get('vwap', 0):.2f} "
-                    f"({w.get('vwap_distance_pct', 0):+.1f}%)")
-            tg_send("📋 *KoiScale Watchlist*\n" + "\n".join(lines))
+                    f"({w.get('vwap_distance_pct', 0):+.1f}%) "
+                    f"_{phase}_ [{bs:.0f}]")
+            tg_send("📋 *KoiScale Watchlist* (score / phase)\n" + "\n".join(lines))
         else:
             tg_send("📋 Watchlist empty — no stage-2 candidates near VWAP yet (scan runs every 15 min)")
 
@@ -1846,7 +1941,8 @@ def cycle():
             tg_send(f"📡 *KoiScale Scan — {len(candidates)} candidates*\n"
                     + "\n".join(f"  *{c.get('symbol','?')}* "
                                 f"${c.get('price',0):.2f} "
-                                f"VWAP {c.get('vwap_distance_pct',0):+.1f}%"
+                                f"({c.get('vwap_distance_pct',0):+.1f}%) "
+                                f"_{c.get('phase','?')}_ [{c.get('bounce_score',0):.0f}]"
                                 for c in candidates[:5])
                     + ("\n  ..." if len(candidates) > 5 else ""))
         else:
