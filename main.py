@@ -214,23 +214,7 @@ def get_live_pnl():
         log("DEBUG", f"Live P&L fetch failed: {e}")
         return None, None
 
-# ── Polygon bar fetching ───────────────────────────────────────────────────────
-
-def _normalize_polygon_bar(e):
-    """Convert Polygon AM WebSocket event dict to Alpaca bar format."""
-    ts = datetime.fromtimestamp(
-        e["s"] / 1000, tz=timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {
-        "t":  ts,
-        "o":  float(e.get("o",  0)),
-        "h":  float(e.get("h",  0)),
-        "l":  float(e.get("l",  0)),
-        "c":  float(e.get("c",  0)),
-        "v":  int(  e.get("v",  0)),
-        "vw": float(e.get("vw", 0)),
-        "n":  int(  e.get("z",  0)),
-    }
+# ── Polygon bar fetching (REST fallback for micro-cap/OTC) ─────────────────────
 
 def _normalize_polygon_agg(r):
     """Convert Polygon REST /v2/aggs result dict to Alpaca bar format."""
@@ -248,21 +232,45 @@ def _normalize_polygon_agg(r):
         "n":  int(  r.get("n",  0)),
     }
 
-# ── Polygon WebSocket — real-time 1-min bar streaming ─────────────────────────
+# ── Alpaca WebSocket — real-time 1-min bar streaming ──────────────────────────
+# Alpaca IEX WebSocket pushes completed 1-min bars the instant they close,
+# cutting bar-data latency from REST poll interval (~8s + up to 60s candle wait)
+# to ~1s after bar close. Free on both paper and live accounts.
+# Falls back to REST polling if WS is unavailable.
+
 _bar_cache     = {}              # sym -> [bar_dict, ...]  (Alpaca format)
 _bar_lock      = threading.Lock()
 _ws_subscribed = set()           # symbols currently subscribed on WS
-_ws_auth_ok    = False           # True once Polygon auth handshake completes
-_polygon_ws    = None            # active WebSocketApp instance
+_ws_auth_ok    = False           # True once Alpaca WS auth handshake completes
+_alpaca_ws     = None            # active WebSocketApp instance
 _ws_backoff    = 5               # current reconnect delay (exponential backoff)
-_ws_policy_fails = 0             # consecutive 1008 (policy violation) closes
-_ws_rest_only  = False           # True = gave up on WS, use REST only
-_ws_last_error_str = ""          # stash error string so on_close can inspect it
+
+
+def _normalize_polygon_agg(r):
+    """Convert Polygon REST /v2/aggs result dict to Alpaca bar format.
+    Used only in the REST fallback path for micro-cap/OTC symbols."""
+    ts = datetime.fromtimestamp(
+        r["t"] / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "t":  ts,
+        "o":  float(r.get("o",  0)),
+        "h":  float(r.get("h",  0)),
+        "l":  float(r.get("l",  0)),
+        "c":  float(r.get("c",  0)),
+        "v":  int(  r.get("v",  0)),
+        "vw": float(r.get("vw", 0)),
+        "n":  int(  r.get("n",  0)),
+    }
 
 
 def _on_ws_open(ws):
-    log("INFO", "Polygon WS: connected — authenticating")
-    ws.send(json.dumps({"action": "auth", "params": POLYGON_KEY}))
+    log("INFO", "Alpaca WS: connected — authenticating")
+    ws.send(json.dumps({
+        "action": "auth",
+        "key":    ALPACA_KEY,
+        "secret": ALPACA_SEC,
+    }))
 
 
 def _on_ws_message(ws, message):
@@ -271,120 +279,124 @@ def _on_ws_message(ws, message):
         events = json.loads(message)
     except Exception:
         return
+    if not isinstance(events, list):
+        events = [events]
     for e in events:
-        ev     = e.get("ev", "")
-        status = e.get("status", "")
+        msg_type = e.get("T", "")
 
-        if ev == "status" and status == "auth_success":
+        # ── Connection established ──
+        if msg_type == "success" and e.get("msg") == "connected":
+            log("DEBUG", "Alpaca WS: connection acknowledged")
+
+        # ── Authenticated ──
+        elif msg_type == "success" and e.get("msg") == "authenticated":
             _ws_auth_ok = True
-            _ws_backoff = 5    # reset backoff on successful auth
-            log("INFO", "Polygon WS: authenticated")
+            _ws_backoff = 5   # reset backoff on success
+            log("INFO", "Alpaca WS: authenticated")
+            # Re-subscribe symbols from prior session (handles reconnects)
             with _bar_lock:
                 syms = list(_ws_subscribed)
             if syms:
-                params = ",".join(f"AM.{s}" for s in syms)
-                ws.send(json.dumps({"action": "subscribe", "params": params}))
-                log("INFO", f"Polygon WS: re-subscribed {len(syms)} symbol(s)")
+                ws.send(json.dumps({"action": "subscribe", "bars": syms}))
+                log("INFO", f"Alpaca WS: re-subscribed {len(syms)} symbol(s)")
 
-        elif ev == "status" and status == "auth_failed":
-            log("ERROR", "Polygon WS: auth FAILED — check POLYGON_API_KEY")
+        # ── Auth or other error ──
+        elif msg_type == "error":
+            code = e.get("code", "")
+            err_msg = e.get("msg", "")
+            log("ERROR", f"Alpaca WS error: [{code}] {err_msg}")
 
-        elif ev == "AM":
-            sym = e.get("sym", "")
+        # ── Subscription confirmation ──
+        elif msg_type == "subscription":
+            bars_list = e.get("bars", [])
+            if bars_list:
+                log("DEBUG", f"Alpaca WS: subscribed to bars for "
+                             f"{len(bars_list)} symbol(s)")
+
+        # ── Completed 1-min bar ──
+        elif msg_type == "b":
+            sym = e.get("S", "")
             if not sym:
                 continue
-            bar = _normalize_polygon_bar(e)
+            bar = {
+                "t":  e.get("t", ""),
+                "o":  float(e.get("o", 0)),
+                "h":  float(e.get("h", 0)),
+                "l":  float(e.get("l", 0)),
+                "c":  float(e.get("c", 0)),
+                "v":  int(e.get("v", 0)),
+                "vw": float(e.get("vw", 0)),
+                "n":  int(e.get("n", 0)),
+            }
             with _bar_lock:
                 first_bar = sym not in _bar_cache
                 if sym not in _bar_cache:
                     _bar_cache[sym] = []
                 _bar_cache[sym].append(bar)
-                if len(_bar_cache[sym]) > 420:   # keep ~7 hours max (full session)
+                if len(_bar_cache[sym]) > 420:   # keep ~7 hours (full session for VWAP)
                     _bar_cache[sym] = _bar_cache[sym][-420:]
             if first_bar:
-                log("DEBUG", f"Polygon WS: first live bar for {sym} "
+                log("DEBUG", f"Alpaca WS: first live bar for {sym} "
                              f"c=${bar['c']} v={bar['v']}")
 
 
 def _on_ws_error(ws, error):
-    global _ws_last_error_str
-    err_str = str(error)
-    _ws_last_error_str = err_str
-    # Parse close frame errors to detect policy violations before on_close fires
-    if "opcode=8" in err_str and "\\x03\\xf0" in err_str:
-        log("WARN", "Polygon WS error: close frame received (code 1008 — Policy Violation)")
-    else:
-        log("WARN", f"Polygon WS error: {error}")
+    log("WARN", f"Alpaca WS error: {error}")
 
 
 def _on_ws_close(ws, code, msg):
-    global _ws_auth_ok, _ws_policy_fails
+    global _ws_auth_ok
     _ws_auth_ok = False
-    # Detect close code 1008 (policy violation) — free-tier Polygon rejects real-time WS
-    # code may be None when websocket-client surfaces the close frame via on_error instead
-    is_policy = (code == 1008
-                 or (code is None and "\\x03\\xf0" in _ws_last_error_str))
-    if is_policy:
-        _ws_policy_fails += 1
-        log("WARN", f"Polygon WS closed (code=1008 Policy Violation) — "
-                     f"attempt {_ws_policy_fails}/5")
-    else:
-        _ws_policy_fails = 0   # reset on non-policy close
-        log("INFO", f"Polygon WS closed (code={code}) — will reconnect")
+    log("INFO", f"Alpaca WS closed (code={code}) — will reconnect")
 
 
-def start_polygon_ws():
-    """Open Polygon WebSocket in a daemon thread. Auto-reconnects on disconnect."""
-    global _polygon_ws, _ws_backoff, _ws_rest_only
+def start_alpaca_ws():
+    """
+    Open Alpaca data WebSocket in a daemon thread. Receives completed 1-min
+    bars in real-time (IEX feed, free). Auto-reconnects with exponential
+    backoff on disconnect.
+    """
+    global _alpaca_ws, _ws_backoff
     if not _WS_AVAILABLE:
         log("WARN", "websocket-client not installed — WS streaming disabled.")
         return
     while True:
-        # If we got 5+ consecutive policy-violation closes, stop trying
-        if _ws_policy_fails >= 5:
-            _ws_rest_only = True
-            _polygon_ws = None
-            log("WARN", "Polygon WS: 5 consecutive 1008 (Policy Violation) closes — "
-                        "your Polygon plan likely does not support real-time WebSocket. "
-                        "Falling back to REST-only bar data. "
-                        "Upgrade your Polygon plan to re-enable WS streaming.")
-            return
         try:
-            _polygon_ws = _websocket_lib.WebSocketApp(
-                "wss://socket.polygon.io/stocks",
+            _alpaca_ws = _websocket_lib.WebSocketApp(
+                "wss://stream.data.alpaca.markets/v2/iex",
                 on_open    = _on_ws_open,
                 on_message = _on_ws_message,
                 on_error   = _on_ws_error,
                 on_close   = _on_ws_close,
             )
-            _polygon_ws.run_forever(ping_interval=30, ping_timeout=10)
+            _alpaca_ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
-            log("WARN", f"Polygon WS thread error: {e}")
-        # Exponential backoff: 5s → 10s → 20s → 40s → cap at 60s
+            log("WARN", f"Alpaca WS thread error: {e}")
         time.sleep(_ws_backoff)
         _ws_backoff = min(_ws_backoff * 2, 60)
 
 
 def ws_subscribe(symbols):
     """
-    Subscribe to real-time AM (1-min bar) events for a list of symbols.
-    Seeds the bar cache from REST immediately on first call per symbol.
+    Subscribe to real-time 1-min bar events for a list of symbols via Alpaca WS,
+    and seed the cache from REST so detect_vwap_bounce() works immediately.
     Idempotent — safe to call every cycle, only acts on new symbols.
     """
-    global _polygon_ws
+    global _alpaca_ws
     new_syms = [s for s in symbols if s not in _ws_subscribed]
     if not new_syms:
         return
 
+    # Seed bar cache from REST (WS only streams bars going forward).
+    # Try Alpaca IEX first; fall back to Polygon REST for micro-caps/OTC.
     for sym in new_syms:
-        # Try Alpaca IEX first; fall back to Polygon REST for broader coverage
         url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
                f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
         resp = GET(url, h=alp_h())
         if resp and resp.get("bars"):
             with _bar_lock:
                 _bar_cache[sym] = resp["bars"][-60:]
-            log("DEBUG", f"Polygon WS: seeded {len(resp['bars'])} bars for {sym} (IEX)")
+            log("DEBUG", f"WS seed: {len(resp['bars'])} bars for {sym} (IEX)")
         else:
             today = now_et().date().isoformat()
             url2  = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
@@ -395,25 +407,25 @@ def ws_subscribe(symbols):
                 bars = [_normalize_polygon_agg(r) for r in resp2["results"][-420:]]
                 with _bar_lock:
                     _bar_cache[sym] = bars
-                log("DEBUG", f"Polygon WS: seeded {len(bars)} bars for {sym} (Polygon REST)")
+                log("DEBUG", f"WS seed: {len(bars)} bars for {sym} (Polygon REST)")
             else:
-                log("WARN", f"Polygon WS: no seed bars for {sym}")
+                log("WARN", f"WS seed: no bars for {sym}")
 
-    if _polygon_ws and _ws_auth_ok:
-        params = ",".join(f"AM.{s}" for s in new_syms)
+    # Subscribe on the live WS connection (if auth is complete)
+    if _alpaca_ws and _ws_auth_ok:
         try:
-            _polygon_ws.send(json.dumps({"action": "subscribe", "params": params}))
-            log("INFO", f"Polygon WS: subscribed AM.* for {new_syms}")
+            _alpaca_ws.send(json.dumps({"action": "subscribe", "bars": new_syms}))
+            log("INFO", f"Alpaca WS: subscribed bars for {new_syms}")
         except Exception as e:
-            log("WARN", f"Polygon WS subscribe error: {e}")
+            log("WARN", f"Alpaca WS subscribe error: {e}")
 
     _ws_subscribed.update(new_syms)
 
 
 def get_1min_bars(sym, limit=60):
     """
-    Fetch 1-min bars. Uses Polygon WebSocket cache when available.
-    Falls back to Alpaca IEX REST, then Polygon REST for broad SIP coverage.
+    Fetch 1-min bars. Uses Alpaca WebSocket cache when available.
+    Falls back to Alpaca IEX REST → Polygon REST when cache is empty.
     KoiScale uses up to 420 bars (full session) for VWAP calculation.
     """
     with _bar_lock:
@@ -1525,26 +1537,24 @@ def handle_cmd(text, cid):
         tg_send(f"📉 Choppy mode: {state}")
 
     elif cmd == "/wsstatus":
-        lib_ok    = "✅ installed" if _WS_AVAILABLE else "❌ missing"
-        if _ws_rest_only:
-            sock_ok = "⚠️ REST-only (WS disabled — plan limit)"
-        else:
-            sock_ok = "✅ connected" if _polygon_ws else "❌ not connected"
+        connected = "✅ connected" if _alpaca_ws else "❌ not connected"
         auth_ok   = "✅ authenticated" if _ws_auth_ok else "❌ not authenticated"
         n_subs    = len(_ws_subscribed)
         with _bar_lock:
+            n_cached = len(_bar_cache)
             cache_info = "\n".join(
                 f"  {sym}: {len(bars)} bars"
                 for sym, bars in list(_bar_cache.items())[:5]
-            ) or "  (empty)"
+            ) or "  (none)"
         tg_send(
-            f"📡 *Polygon WebSocket Status*\n"
-            f"Library: {lib_ok}\n"
-            f"Socket:  {sock_ok}\n"
+            f"📡 *Alpaca WebSocket Status*\n"
+            f"Socket:  {connected}\n"
             f"Auth:    {auth_ok}\n"
-            f"Policy fails: {_ws_policy_fails}\n"
+            f"Feed:    IEX (free real-time)\n"
             f"Subscribed: {n_subs} symbol(s)\n"
-            f"Bar cache (first 5):\n{cache_info}")
+            f"Bar cache ({n_cached} symbol(s)):\n{cache_info}\n\n"
+            f"ℹ️ Bars pushed in real-time on minute close. "
+            f"REST fallback active if WS disconnects.")
 
     elif cmd == "/help":
         tg_send(
@@ -1557,7 +1567,7 @@ def handle_cmd(text, cid):
             f"/stop     — halt all trading\n"
             f"/resume   — resume after halt/stop\n"
             f"/choppy   — toggle choppy mode (fast exits)\n"
-            f"/wsstatus — Polygon WebSocket health\n"
+            f"/wsstatus — Alpaca WebSocket + bar cache state\n"
             f"/help     — this message\n\n"
             f"Strategy: VWAP mean reversion (Brian Shannon)\n"
             f"Window:   9:35–15:30 ET | all-day VWAP setups")
@@ -1987,17 +1997,14 @@ def main():
 
     startup()
 
-    # Polygon WebSocket — disabled: free-tier Polygon does not support real-time WS.
-    # Bar data falls back to Alpaca IEX REST → Polygon REST automatically.
-    # To re-enable: upgrade Polygon plan and uncomment:
-    # t_ws = threading.Thread(target=start_polygon_ws, daemon=True)
-    # t_ws.start()
-    log("INFO", "Polygon WS: disabled (free-tier plan — using REST fallback for bar data)")
+    # Alpaca WebSocket for real-time 1-min bar streaming (free on IEX feed)
+    t_ws = threading.Thread(target=start_alpaca_ws, daemon=True)
+    t_ws.start()
 
     # Start trading cycle on its own thread — decoupled from Telegram
     t_cycle = threading.Thread(target=_cycle_loop, daemon=True)
     t_cycle.start()
-    log("INFO", "Main loop active — cycle: 8s thread | Polygon WS: live bars | Telegram: long-poll 25s")
+    log("INFO", "Main loop active — cycle: 8s thread | Alpaca WS: live bars | Telegram: long-poll 25s")
 
     # Main thread: Telegram commands only
     while True:
