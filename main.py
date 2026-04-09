@@ -388,26 +388,27 @@ def ws_subscribe(symbols):
         return
 
     # Seed bar cache from REST (WS only streams bars going forward).
-    # Try Alpaca IEX first; fall back to Polygon REST for micro-caps/OTC.
+    # Primary: Polygon REST (consolidated tape, full coverage for mid/large-caps).
+    # Fallback: Alpaca IEX REST (sparse for KoiScale's universe).
     for sym in new_syms:
-        url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
-               f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
-        resp = GET(url, h=alp_h())
-        if resp and resp.get("bars"):
+        today = now_et().date().isoformat()
+        url = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
+               f"{today}/{today}?adjusted=false&sort=asc&limit=420"
+               f"&apiKey={POLYGON_KEY}")
+        resp = GET(url)
+        if resp and resp.get("results"):
+            bars = [_normalize_polygon_agg(r) for r in resp["results"][-420:]]
             with _bar_lock:
-                _bar_cache[sym] = resp["bars"][-60:]
-            log("DEBUG", f"WS seed: {len(resp['bars'])} bars for {sym} (IEX)")
+                _bar_cache[sym] = bars
+            log("DEBUG", f"WS seed: {len(bars)} bars for {sym} (Polygon REST)")
         else:
-            today = now_et().date().isoformat()
-            url2  = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
-                     f"{today}/{today}?adjusted=false&sort=asc&limit=420"
-                     f"&apiKey={POLYGON_KEY}")
-            resp2 = GET(url2)
-            if resp2 and resp2.get("results"):
-                bars = [_normalize_polygon_agg(r) for r in resp2["results"][-420:]]
+            url2 = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+                    f"?timeframe=1Min&limit=60&feed=iex&adjustment=raw")
+            resp2 = GET(url2, h=alp_h())
+            if resp2 and resp2.get("bars"):
                 with _bar_lock:
-                    _bar_cache[sym] = bars
-                log("DEBUG", f"WS seed: {len(bars)} bars for {sym} (Polygon REST)")
+                    _bar_cache[sym] = resp2["bars"][-60:]
+                log("DEBUG", f"WS seed: {len(resp2['bars'])} bars for {sym} (IEX)")
             else:
                 log("WARN", f"WS seed: no bars for {sym}")
 
@@ -424,26 +425,30 @@ def ws_subscribe(symbols):
 
 def get_1min_bars(sym, limit=60):
     """
-    Fetch 1-min bars. Uses Alpaca WebSocket cache when available.
-    Falls back to Alpaca IEX REST → Polygon REST when cache is empty.
+    Fetch 1-min bars for KoiScale's mid/large-cap universe.
+    Primary: Polygon REST (Stock Starter plan — full consolidated data).
+    Fallback: Alpaca IEX REST (sparse coverage for mid/large-caps).
+    WS cache checked first if ever re-enabled.
     KoiScale uses up to 420 bars (full session) for VWAP calculation.
     """
     with _bar_lock:
         cached = list(_bar_cache.get(sym, []))
     if cached:
         return cached[-limit:]
-    url = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
-           f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
-    resp = GET(url, h=alp_h())
-    if resp and resp.get("bars"):
-        return resp["bars"]
+    # Primary: Polygon REST — consolidated tape, full bar coverage
     today = now_et().date().isoformat()
-    url2  = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
-             f"{today}/{today}?adjusted=false&sort=asc&limit={limit}"
-             f"&apiKey={POLYGON_KEY}")
-    resp2 = GET(url2)
-    if resp2 and resp2.get("results"):
-        return [_normalize_polygon_agg(r) for r in resp2["results"][-limit:]]
+    url = (f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute/"
+           f"{today}/{today}?adjusted=false&sort=asc&limit={limit}"
+           f"&apiKey={POLYGON_KEY}")
+    resp = GET(url)
+    if resp and resp.get("results"):
+        return [_normalize_polygon_agg(r) for r in resp["results"][-limit:]]
+    # Fallback: Alpaca IEX REST
+    url2 = (f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+            f"?timeframe=1Min&limit={limit}&feed=iex&adjustment=raw")
+    resp2 = GET(url2, h=alp_h())
+    if resp2 and resp2.get("bars"):
+        return resp2["bars"]
     return []
 
 
