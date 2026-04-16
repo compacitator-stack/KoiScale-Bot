@@ -94,6 +94,23 @@ CORE_END         = (15, 30)    # 3:30 ET (30 min before close)
 EOD_LIQUIDATE    = (15, 55)    # forced close if any positions still open
 SCAN_INTERVAL_MINS = 15        # re-evaluate watchlist every 15 min
 
+# ── Index ETF VWAP mode (high-VIX) ──────────────────────────────────────────
+# When VIX > 25, add SPY/QQQ/IWM to watchlist and use pure VWAP bounce logic
+# (bypass stage-2 MA filter). Shannon explicitly teaches VWAP on indices.
+INDEX_ETF_VWAP_MODE = True     # enable index ETF injection when VIX elevated
+INDEX_ETFS          = ["SPY", "QQQ", "IWM"]
+VIX_THRESHOLD_ETF   = 25       # VIX level above which index ETFs are injected
+VIX_MAX_HALT        = 50       # above this VIX, halt even index ETF trading
+
+# ── Recovery mode (recently stage-2 stocks) ──────────────────────────────────
+# During market recoveries (VIX > 20, declining from higher), allow stocks that
+# were stage-2 aligned within the last 30 days but broke alignment during the
+# selloff. Must show high RS vs SPY and be reclaiming VWAP.
+RECOVERY_MODE           = True  # enable recovery universe path
+RECOVERY_LOOKBACK_DAYS  = 30    # how far back to check for prior stage-2 alignment
+RECOVERY_RS_THRESHOLD   = 0.03  # stock must have outperformed SPY by 3%+ during selloff
+RECOVERY_VIX_MIN        = 20    # only activate recovery mode when VIX > this
+
 LOG_FILE     = "koiscale.log"
 STATUS_FILE  = "koiscale_status.json"
 TRADES_FILE  = "koiscale_trades.json"
@@ -538,6 +555,213 @@ def is_stage2(mas):
     return True, "stage-2 ✅"
 
 
+# ── VIX fetch (shared by index ETF mode + recovery mode) ─────────────────────
+_vix_cache = {"date": "", "vix": 0.0}
+
+def fetch_vix():
+    """Fetch current VIX level. Cached per day. Falls back to VIXY ETF proxy."""
+    global _vix_cache
+    today = now_et().strftime("%Y-%m-%d")
+    if _vix_cache["date"] == today and _vix_cache["vix"] > 0:
+        return _vix_cache["vix"]
+
+    vix_val = 0.0
+    # Method 1: Polygon index prev-day close
+    try:
+        resp = GET(f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev?apiKey={POLYGON_KEY}")
+        if resp and resp.get("results"):
+            vix_val = float(resp["results"][0].get("c", 0))
+    except Exception:
+        pass
+    # Method 2: Polygon snapshot
+    if vix_val <= 0:
+        try:
+            resp = GET(f"https://api.polygon.io/v3/snapshot?ticker.any_of=I:VIX&apiKey={POLYGON_KEY}")
+            if resp and resp.get("results"):
+                for r in resp["results"]:
+                    c = r.get("session", {}).get("close") or r.get("session", {}).get("previous_close")
+                    if c:
+                        vix_val = float(c)
+                        break
+        except Exception:
+            pass
+    # Method 3: VIXY ETF proxy
+    if vix_val <= 0:
+        try:
+            bars = fetch_daily_bars("VIXY", n_bars=5)
+            if bars:
+                vixy_close = float(bars[-1].get("c", 0))
+                if vixy_close > 25:
+                    vix_val = 36.0  # elevated
+                else:
+                    vix_val = 20.0  # normal
+                log("DEBUG", f"VIX: using VIXY proxy ({vixy_close:.1f}) -> VIX ~{vix_val:.0f}")
+        except Exception:
+            pass
+
+    if vix_val > 0:
+        _vix_cache = {"date": today, "vix": vix_val}
+    log("INFO", f"VIX level: {vix_val:.1f}")
+    return vix_val
+
+
+def scan_index_etfs():
+    """
+    Build index ETF candidates for VWAP bounce trading when VIX is elevated.
+    Bypasses stage-2 MA filter — ETFs don't need it; the setup IS the VWAP touch.
+    Returns list of candidate dicts compatible with scan_stage2_universe output.
+    """
+    if not INDEX_ETF_VWAP_MODE:
+        return []
+    vix = fetch_vix()
+    if vix < VIX_THRESHOLD_ETF:
+        log("DEBUG", f"Index ETF mode: VIX {vix:.1f} < {VIX_THRESHOLD_ETF} — skipping")
+        return []
+    if vix > VIX_MAX_HALT:
+        log("INFO", f"Index ETF mode: VIX {vix:.1f} > {VIX_MAX_HALT} — too extreme, skipping")
+        return []
+
+    log("INFO", f"Index ETF mode ACTIVE: VIX {vix:.1f} > {VIX_THRESHOLD_ETF} "
+                f"— scanning {INDEX_ETFS}")
+
+    candidates = []
+    for sym in INDEX_ETFS:
+        try:
+            bars = get_1min_bars(sym, limit=420)
+            if not bars or len(bars) < 30:
+                log("DEBUG", f"  {sym}: insufficient bars ({len(bars) if bars else 0})")
+                continue
+            vwap = calc_vwap(bars)
+            if not vwap:
+                continue
+            price = float(bars[-1]["c"])
+            dist_pct = (price - vwap) / vwap * 100
+            if abs(dist_pct) > VWAP_PROXIMITY_PCT * 2:
+                log("DEBUG", f"  {sym}: too far from VWAP ({dist_pct:+.2f}%)")
+                continue
+
+            # Minimal MAs for display (not used as gate)
+            daily = fetch_daily_bars(sym, n_bars=220)
+            mas = compute_mas(daily) if daily else None
+
+            candidates.append({
+                "symbol":           sym,
+                "price":            round(price, 2),
+                "vwap":             vwap,
+                "vwap_distance_pct": round(dist_pct, 2),
+                "bounce_score":     50.0,  # placeholder — real score computed in VWAP scorer
+                "phase":            "INDEX_ETF",
+                "mas":              mas,
+                "volume":           sum(int(b["v"]) for b in bars[-30:]),
+                "_index_etf":       True,
+            })
+            log("INFO", f"  {sym}: ${price:.2f} VWAP ${vwap:.2f} ({dist_pct:+.1f}%) — added")
+        except Exception as e:
+            log("DEBUG", f"  {sym}: error — {e}")
+    return candidates
+
+
+def was_recently_stage2(sym, lookback_days=RECOVERY_LOOKBACK_DAYS):
+    """
+    Check if a stock was stage-2 aligned within the last N trading days.
+    Returns (True, days_ago) or (False, None).
+    """
+    bars = fetch_daily_bars(sym, n_bars=lookback_days + 220)
+    if not bars or len(bars) < 220:
+        return False, None
+    closes = [float(b["c"]) for b in bars]
+
+    # Walk backwards through the lookback window and check stage-2 at each day
+    for offset in range(1, min(lookback_days, len(closes) - 220) + 1):
+        end = len(closes) - offset
+        if end < 200:
+            break
+        window = closes[:end]
+        sma20  = sum(window[-20:]) / 20
+        sma50  = sum(window[-50:]) / 50
+        sma200 = sum(window[-200:]) / 200
+        if sma20 > sma50 > sma200:
+            return True, offset
+    return False, None
+
+
+def calc_relative_strength_vs_spy(sym, days=20):
+    """
+    Calculate how much a stock outperformed/underperformed SPY over N days.
+    Returns float: positive = outperformed (e.g. 0.05 = +5% vs SPY).
+    """
+    try:
+        stock_bars = fetch_daily_bars(sym, n_bars=days + 5)
+        spy_bars   = fetch_daily_bars("SPY", n_bars=days + 5)
+        if not stock_bars or not spy_bars or len(stock_bars) < days or len(spy_bars) < days:
+            return 0.0
+        stock_ret = (float(stock_bars[-1]["c"]) - float(stock_bars[-days]["c"])) / float(stock_bars[-days]["c"])
+        spy_ret   = (float(spy_bars[-1]["c"]) - float(spy_bars[-days]["c"])) / float(spy_bars[-days]["c"])
+        return stock_ret - spy_ret
+    except Exception:
+        return 0.0
+
+
+def scan_recovery_candidates(snapshot_pre):
+    """
+    Find recovery candidates: stocks that were recently stage-2 but broke
+    alignment during a selloff. Must show relative strength vs SPY.
+    Returns list of candidate dicts compatible with scan_stage2_universe output.
+    """
+    if not RECOVERY_MODE:
+        return []
+    vix = fetch_vix()
+    if vix < RECOVERY_VIX_MIN:
+        return []
+
+    log("INFO", f"Recovery mode ACTIVE: VIX {vix:.1f} > {RECOVERY_VIX_MIN} "
+                f"— scanning for recently-stage-2 stocks")
+
+    # From the pre-filtered snapshot, check stocks that FAILED stage-2
+    # but were recently aligned
+    recovery = []
+    checked = 0
+    for cand in snapshot_pre[:100]:  # cap to avoid excessive API calls
+        sym = cand["symbol"]
+        # Skip if it's already stage-2 (handled by normal path)
+        with _daily_ma_lock:
+            cached = _daily_ma_cache.get(sym)
+        if cached and cached.get("cached_date") == now_et().date().isoformat():
+            ok, _ = is_stage2(cached)
+            if ok:
+                continue  # already qualifies normally
+
+        checked += 1
+        was_s2, days_ago = was_recently_stage2(sym)
+        if not was_s2:
+            continue
+
+        rs = calc_relative_strength_vs_spy(sym, days=20)
+        if rs < RECOVERY_RS_THRESHOLD:
+            log("DEBUG", f"  {sym}: was stage-2 {days_ago}d ago but RS {rs:+.1%} < {RECOVERY_RS_THRESHOLD:+.1%}")
+            continue
+
+        # Get current MAs for display
+        bars = fetch_daily_bars(sym, n_bars=220)
+        mas = compute_mas(bars) if bars else None
+
+        recovery.append({
+            **cand,
+            "mas": mas,
+            "_recovery": True,
+            "_was_stage2_days_ago": days_ago,
+            "_rs_vs_spy": round(rs, 4),
+        })
+        log("INFO", f"  RECOVERY: {sym} ${cand['price']:.2f} — "
+                     f"was stage-2 {days_ago}d ago, RS vs SPY {rs:+.1%}")
+
+        if len(recovery) >= 10:  # cap recovery candidates
+            break
+
+    log("INFO", f"Recovery scan: checked {checked}, found {len(recovery)} candidates")
+    return recovery
+
+
 # ── VWAP calculation ──────────────────────────────────────────────────────────
 def calc_vwap(bars):
     """
@@ -647,10 +871,32 @@ def scan_stage2_universe():
     log("INFO", f"scan_stage2_universe: {len(stage2)} stage-2 stocks "
                 f"(of {len(pre)} candidates)")
 
+    # ── Step 3b: Index ETF injection (high-VIX mode) ──────────��──────────────
+    # When VIX is elevated, add SPY/QQQ/IWM directly — they bypass stage-2
+    # because the setup is the VWAP touch itself, not MA alignment.
+    index_etf_candidates = scan_index_etfs()
+    if index_etf_candidates:
+        stage2_syms = {c["symbol"] for c in stage2}
+        for etf in index_etf_candidates:
+            if etf["symbol"] not in stage2_syms:
+                stage2.append(etf)
+        log("INFO", f"  +{len(index_etf_candidates)} index ETF(s) injected")
+
+    # ── Step 3c: Recovery mode injection ───��─────────────────────────────────
+    # Stocks that were recently stage-2 but broke alignment during selloff,
+    # showing relative strength vs SPY. Shannon: "buy strength after the dip."
+    recovery_candidates = scan_recovery_candidates(pre)
+    if recovery_candidates:
+        stage2_syms = {c["symbol"] for c in stage2}
+        for rc in recovery_candidates:
+            if rc["symbol"] not in stage2_syms:
+                stage2.append(rc)
+        log("INFO", f"  +{len(recovery_candidates)} recovery candidate(s) injected")
+
     if not stage2:
         return []
 
-    # ── Step 4: VWAP bounce-quality scoring (parallel) ─────────────────────────
+    # ── Step 4: VWAP bounce-quality scoring (parallel) ───────────────���─────────
     def _vwap_score(cand):
         sym   = cand["symbol"]
         price = cand["price"]
@@ -1662,9 +1908,25 @@ def handle_cmd(text, cid):
             f"/resume   — resume after halt/stop\n"
             f"/choppy   — toggle choppy mode (fast exits)\n"
             f"/wsstatus — Alpaca WebSocket + bar cache state\n"
+            f"/vix      — VIX level + active modes\n"
             f"/help     — this message\n\n"
             f"Strategy: VWAP mean reversion (Brian Shannon)\n"
             f"Window:   9:35–15:30 ET | all-day VWAP setups")
+
+    elif cmd == "/vix":
+        vix = fetch_vix()
+        modes = []
+        if INDEX_ETF_VWAP_MODE and vix >= VIX_THRESHOLD_ETF:
+            modes.append(f"🏛 Index ETF mode (VIX > {VIX_THRESHOLD_ETF})")
+        if RECOVERY_MODE and vix >= RECOVERY_VIX_MIN:
+            modes.append(f"♻ Recovery mode (VIX > {RECOVERY_VIX_MIN})")
+        if vix >= VIX_MAX_HALT:
+            modes.append(f"🛑 Extreme VIX halt (> {VIX_MAX_HALT})")
+        if not modes:
+            modes.append("Standard stage-2 only")
+        tg_send(f"📊 *VIX Status*\n"
+                f"VIX: {vix:.1f}\n"
+                f"Modes active:\n" + "\n".join(f"  {m}" for m in modes))
 
     else:
         tg_send(f"Unknown command: {cmd}\nSend /help for available commands")
@@ -1938,12 +2200,33 @@ def cycle():
             S.watchlist = candidates
             S.scanned   = True
             log("INFO", f"Scan found {len(candidates)} stage-2 candidates")
-            tg_send(f"📡 *KoiScale Scan — {len(candidates)} candidates*\n"
+            # Build mode indicators
+            vix = fetch_vix()
+            mode_tags = []
+            if vix >= VIX_THRESHOLD_ETF:
+                mode_tags.append(f"VIX {vix:.0f} — index ETF mode")
+            if vix >= RECOVERY_VIX_MIN and RECOVERY_MODE:
+                mode_tags.append("recovery mode")
+            mode_line = ("\n" + " | ".join(mode_tags)) if mode_tags else ""
+
+            n_etf = sum(1 for c in candidates if c.get("_index_etf"))
+            n_rec = sum(1 for c in candidates if c.get("_recovery"))
+            source_line = ""
+            if n_etf or n_rec:
+                parts = []
+                if n_etf: parts.append(f"{n_etf} index ETF")
+                if n_rec: parts.append(f"{n_rec} recovery")
+                source_line = f"\n({' + '.join(parts)} + {len(candidates)-n_etf-n_rec} stage-2)"
+
+            tg_send(f"📡 *KoiScale Scan — {len(candidates)} candidates*"
+                    + mode_line + source_line + "\n"
                     + "\n".join(f"  *{c.get('symbol','?')}* "
                                 f"${c.get('price',0):.2f} "
                                 f"({c.get('vwap_distance_pct',0):+.1f}%) "
                                 f"_{c.get('phase','?')}_ [{c.get('bounce_score',0):.0f}]"
-                                for c in candidates[:5])
+                                + (" 🏛" if c.get("_index_etf") else "")
+                                + (" ♻" if c.get("_recovery") else "")
+                                for c in candidates[:8])
                     + ("\n  ..." if len(candidates) > 5 else ""))
         else:
             S.scanned = True
