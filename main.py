@@ -99,7 +99,12 @@ SCAN_INTERVAL_MINS = 15        # re-evaluate watchlist every 15 min
 # (bypass stage-2 MA filter). Shannon explicitly teaches VWAP on indices.
 INDEX_ETF_VWAP_MODE = True     # enable index ETF injection when VIX elevated
 INDEX_ETFS          = ["SPY", "QQQ", "IWM"]
-VIX_THRESHOLD_ETF   = 25       # VIX level above which index ETFs are injected
+VIX_THRESHOLD_ETF   = 15       # VIX level above which index ETFs are injected
+                               # Lowered 25→15 (2026-04-16): Shannon teaches VWAP on
+                               # indices unconditionally; VIX 25 gate was a self-imposed
+                               # safety rail that auto-disabled exactly when the 2026-04
+                               # V-bounce was rallying. 15 keeps a sanity floor without
+                               # blocking normal-vol uptrends. See [[Trading Bot Design Principles]].
 VIX_MAX_HALT        = 50       # above this VIX, halt even index ETF trading
 
 # ── Recovery mode (recently stage-2 stocks) ──────────────────────────────────
@@ -109,7 +114,10 @@ VIX_MAX_HALT        = 50       # above this VIX, halt even index ETF trading
 RECOVERY_MODE           = True  # enable recovery universe path
 RECOVERY_LOOKBACK_DAYS  = 30    # how far back to check for prior stage-2 alignment
 RECOVERY_RS_THRESHOLD   = 0.03  # stock must have outperformed SPY by 3%+ during selloff
-RECOVERY_VIX_MIN        = 20    # only activate recovery mode when VIX > this
+RECOVERY_VIX_MIN        = 15    # only activate recovery mode when VIX > this
+                                # Lowered 20→15 (2026-04-16): "buy strength after the dip"
+                                # is valid well after VIX normalizes from a panic spike.
+                                # Prior threshold deactivated recovery mode mid-bounce.
 
 LOG_FILE     = "koiscale.log"
 STATUS_FILE  = "koiscale_status.json"
@@ -509,7 +517,9 @@ def compute_mas(daily_bars):
       sma_5_slope   >= 0 (flat or rising)
     """
     closes = [float(b["c"]) for b in daily_bars]
-    if len(closes) < 200:
+    # Need 200 + MA_200_SLOPE_DAYS bars for correct slope calculation
+    min_bars = 200 + MA_200_SLOPE_DAYS
+    if len(closes) < min_bars:
         return None
 
     def sma(n):
@@ -640,9 +650,13 @@ def scan_index_etfs():
                 log("DEBUG", f"  {sym}: too far from VWAP ({dist_pct:+.2f}%)")
                 continue
 
-            # Minimal MAs for display (not used as gate)
+            # Compute MAs and cache for confluence scoring in detect_vwap_bounce
             daily = fetch_daily_bars(sym, n_bars=220)
             mas = compute_mas(daily) if daily else None
+            if mas:
+                mas["cached_date"] = now_et().date().isoformat()
+                with _daily_ma_lock:
+                    _daily_ma_cache[sym] = mas
 
             candidates.append({
                 "symbol":           sym,
@@ -741,9 +755,13 @@ def scan_recovery_candidates(snapshot_pre):
             log("DEBUG", f"  {sym}: was stage-2 {days_ago}d ago but RS {rs:+.1%} < {RECOVERY_RS_THRESHOLD:+.1%}")
             continue
 
-        # Get current MAs for display
+        # Compute MAs and cache for confluence scoring in detect_vwap_bounce
         bars = fetch_daily_bars(sym, n_bars=220)
         mas = compute_mas(bars) if bars else None
+        if mas:
+            mas["cached_date"] = now_et().date().isoformat()
+            with _daily_ma_lock:
+                _daily_ma_cache[sym] = mas
 
         recovery.append({
             **cand,
@@ -1378,7 +1396,29 @@ def _finalize_position(pos, outcome):
     S.trade_count += 1
     S.traded_today.add(sym)
 
-    emoji = {"STOPPED": "🔴", "STOPPED_BE": "⚪", "CLOSED": "🟢", "EOD": "⏰"}.get(outcome, "❓")
+    # Track KoiScale-only P&L from actual fills (not account-wide equity)
+    # Estimate: for STOPPED, lost risk per share × filled qty
+    #           for CLOSED/EOD, approximate from targets vs entry
+    entry_px = pos.get("avg_entry", pos["entry"])
+    filled   = pos.get("filled_qty", 0)
+    if outcome == "STOPPED" and filled > 0:
+        S.internal_pnl += (pos["stop_1"] - entry_px) * filled
+    elif outcome == "STOPPED_BE" and filled > 0:
+        sold_at_t1 = pos["t1_qty"]
+        t1_pnl = (pos["target_1"] - entry_px) * sold_at_t1
+        rest_pnl = (entry_px - entry_px) * (filled - sold_at_t1)  # BE = ~0
+        S.internal_pnl += t1_pnl + rest_pnl
+    elif outcome in ("CLOSED", "EOD", "EMERGENCY") and filled > 0:
+        # Best estimate from tranche targets; actual may differ
+        t1_pnl = (pos["target_1"] - entry_px) * pos.get("t1_qty", 0)
+        t2_pnl = (pos["target_2"] - entry_px) * pos.get("t2_qty", 0)
+        # T3 and EOD exits are approximate — use trailing_stop as estimate
+        t3_exit = pos.get("trailing_stop", entry_px)
+        t3_pnl = (t3_exit - entry_px) * pos.get("t3_qty", 0)
+        S.internal_pnl += t1_pnl + t2_pnl + t3_pnl
+    S.internal_pnl = round(S.internal_pnl, 2)
+
+    emoji = {"STOPPED": "🔴", "STOPPED_BE": "⚪", "CLOSED": "🟢", "EOD": "⏰", "EMERGENCY": "🚨"}.get(outcome, "❓")
     log("INFO", f"  [{sym}] position closed: {outcome}")
     tg_send(
         f"{emoji} *{sym}* closed — {outcome}\n"
@@ -1570,14 +1610,48 @@ def manage_exits():
             pos["avg_entry"] = avg_px if avg_px > 0 else pos["entry"]
             pos["filled_qty"] = pos["total_qty"] if fq == 0 else fq
 
+            # Recalculate tranche sizes if partial fill changed qty
+            if pos["filled_qty"] != pos["total_qty"]:
+                actual = pos["filled_qty"]
+                t1_pct = CHOPPY_T1_PCT if pos.get("choppy") else TRANCHE_1_PCT
+                pos["t1_qty"] = max(1, int(actual * t1_pct))
+                pos["t2_qty"] = max(1, int(actual * TRANCHE_2_PCT))
+                pos["t3_qty"] = actual - pos["t1_qty"] - pos["t2_qty"]
+                if pos["t3_qty"] < 1:
+                    pos["t3_qty"] = 0
+                    pos["t2_qty"] = max(1, actual - pos["t1_qty"])
+                    if pos["t2_qty"] + pos["t1_qty"] > actual:
+                        pos["t2_qty"] = 0
+                pos["total_qty"] = actual
+                log("INFO", f"  [{sym}] partial fill: recalculated tranches "
+                    f"T1={pos['t1_qty']} T2={pos['t2_qty']} T3={pos['t3_qty']}")
+
             # Submit stop-loss first (crash safety), then T1 limit
+            # Retry once on failure; emergency market-sell if stop can't be placed
             sl_r = _place_stop_order(sym, pos["filled_qty"], pos["stop_1"])
+            if not sl_r:
+                time.sleep(1)
+                sl_r = _place_stop_order(sym, pos["filled_qty"], pos["stop_1"])
             if sl_r:
                 pos["stop_order_id"] = sl_r["id"]
+            else:
+                log("ERROR", f"  [{sym}] CRITICAL: stop order failed after retry — emergency market sell")
+                tg_send(f"🚨 *{sym}* CRITICAL: stop order failed — emergency market sell {pos['filled_qty']}sh")
+                _place_market_sell(sym, pos["filled_qty"])
+                pos["state"] = "CLOSED"
+                _finalize_position(pos, "EMERGENCY")
+                to_remove.append(oid)
+                continue
 
             t1_r = _place_limit_sell(sym, pos["t1_qty"], pos["target_1"], label="T1")
+            if not t1_r:
+                time.sleep(1)
+                t1_r = _place_limit_sell(sym, pos["t1_qty"], pos["target_1"], label="T1")
             if t1_r:
                 pos["t1_order_id"] = t1_r["id"]
+            else:
+                log("WARN", f"  [{sym}] T1 limit sell failed — will rely on stop + EOD")
+                tg_send(f"⚠️ *{sym}* T1 limit sell failed — position protected by stop only")
 
             pos["state"] = "FULL"
             log("INFO",
@@ -1707,7 +1781,8 @@ class State:
         self.traded_today       = set()  # syms with submitted orders today
         self.trades_today       = []     # list of completed trade dicts
         self.trade_count        = 0
-        self.pnl                = 0.0
+        self.pnl                = 0.0    # account-wide P&L (for display)
+        self.internal_pnl       = 0.0    # KoiScale-only P&L from closed fills
         self.scanned            = False
         self.halted             = False  # loss-limit auto-halt
         self.stopped            = False  # manual /stop
@@ -1739,6 +1814,7 @@ class State:
         self.trades_today       = []
         self.trade_count        = 0
         self.pnl                = 0.0
+        self.internal_pnl       = 0.0
         self.scanned            = False
         self.halted             = False
         self.stopped            = False
@@ -2172,12 +2248,14 @@ def cycle():
         S.equity = live_eq
 
     # ── Daily loss limit check ────────────────────────────────────────────────
-    if S.pnl <= MAX_LOSS and not S.halted:
+    # Use KoiScale-internal P&L (from own fills) as primary; account P&L as secondary
+    koiscale_pnl = S.internal_pnl if S.internal_pnl != 0.0 else S.pnl
+    if koiscale_pnl <= MAX_LOSS and not S.halted:
         S.halted = True
         tg_send(f"🛑 *DAILY LOSS LIMIT HIT*\n"
-                f"P&L: ${S.pnl:+.2f} | Limit: ${MAX_LOSS:.0f}\n"
+                f"KoiScale P&L: ${S.internal_pnl:+.2f} | Acct P&L: ${S.pnl:+.2f} | Limit: ${MAX_LOSS:.0f}\n"
                 f"All trading halted. Send /resume to override.")
-        log("WARN", f"Loss limit hit: ${S.pnl:.2f}")
+        log("WARN", f"Loss limit hit: KoiScale=${S.internal_pnl:.2f} Acct=${S.pnl:.2f}")
         S.save()
 
     if S.halted or S.stopped:
@@ -2321,6 +2399,21 @@ def startup():
                 + (" — drawdown sizing ACTIVE (0.5×)" if crd >= 2 else ""))
     except Exception:
         pass
+
+    # Check for orphaned Alpaca positions not tracked by KoiScale
+    try:
+        existing = get_positions()
+        if existing:
+            orphan_syms = [p.get("symbol", "?") for p in existing]
+            orphan_qty  = sum(abs(int(float(p.get("qty", 0)))) for p in existing)
+            log("WARN", f"ORPHANED POSITIONS detected: {orphan_syms} ({orphan_qty} total shares)")
+            tg_send(
+                f"⚠️ *Orphaned positions detected on startup*\n"
+                f"Symbols: {', '.join(orphan_syms)}\n"
+                f"Total shares: {orphan_qty}\n"
+                f"These are NOT managed by KoiScale. Check manually or close via Alpaca dashboard.")
+    except Exception as e:
+        log("DEBUG", f"Orphan position check failed: {e}")
 
     tg_send(
         f"🟢 *KoiScale v1 Started*\n"
